@@ -65,9 +65,9 @@ public class Download {
 	 * <p>
 	 * Also creates the new local file for writing.
 	 * 
-	 * @throws IOException If error creating local file.
+	 * @throws AbortDownloadException If error creating local file.
 	 */
-	public Download() throws IOException {
+	public Download() throws AbortDownloadException {
 		this(null);
 	}
 
@@ -77,18 +77,18 @@ public class Download {
 	 * Also creates the new local file for writing.
 	 * 
 	 * @param name Name of file to download
-	 * @throws IOException If error creating local file.
+	 * @throws AbortDownloadException If error creating local file.
 	 */
-	public Download(String name) throws IOException {
-		// create a temp file
-		file = Files.createTempFile("gecpdownload-", null);
-		// if no file name was given, we are done
-		if (name == null) {
-			return;
-		}
-		// store the file name as given, before processing for use
-		this.name = name;
+	public Download(String name) throws AbortDownloadException {
 		try {
+			// create a temp file
+			file = Files.createTempFile("gecpdownload-", null);
+			// if no file name was given, we are done
+			if (name == null) {
+				return;
+			}
+			// store the file name as given, before processing for use
+			this.name = name;
 			/*
 			 * Chapter 5.  YMODEM Batch File Transmission
 			 * If directories are included, they are delimited by /; i.e.,
@@ -130,6 +130,14 @@ public class Download {
 		} catch (InvalidPathException e) {
 			// if can't create a named path, just fall back to using the temp file
 			return;
+		} catch (IOException e) {
+			/*
+			 * Chapter 5.  YMODEM Batch File Transmission
+			 * If the file cannot be
+			 * opened for writing, the receiver cancels the transfer with CAN characters
+			 * as described above.
+			 */
+			throw new AbortDownloadException("Error creating file.", e);
 		}
 	}
 
@@ -147,12 +155,14 @@ public class Download {
 	/**
 	 * Reset the downloaded file's modification time to the time given by
 	 * the sender, if available.
-	 * 
-	 * @throws IOException If unable to update modification time
 	 */
-	public void resetLastModified() throws IOException {
+	public void resetLastModified() {
 		if (modified != null) {
-			Files.setLastModifiedTime(file, modified);
+			try {
+				Files.setLastModifiedTime(file, modified);
+			} catch (IOException e) {
+				// just ignore the error
+			}
 		}
 	}
 }

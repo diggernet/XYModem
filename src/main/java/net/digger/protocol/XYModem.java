@@ -30,8 +30,8 @@ import net.digger.util.crc.CRC;
  * for downloading files.
  * <p>
  * Supports XModem-Checksum, XModem-CRC, XModem-1k, YModem-Batch, YModem-G.<br>
- * Implements just enough of ZModem to support AutoDownload, relying on sender
- * fallback to X/YModem.
+ * Implements just enough of ZModem to support AutoDownload, relying on 
+ * automatic sender fallback to X/YModem, if available.
  * <p>
  * Based on X/YMODEM Protocol Reference, June 18 1988:<br>
  * http://pauillac.inria.fr/~doligez/zmodem/ymodem.txt<br>
@@ -86,10 +86,22 @@ public class XYModem {
 	private boolean block0Done = false;
 	private int autoDownloadIndex = 0;
 	
+	/**
+	 * Create new instance of XYModem.
+	 * 
+	 * @param ioHandler IOHandler instance to use.
+	 */
 	public XYModem(IOHandler ioHandler) {
 		this.io = ioHandler;
 	}
 	
+	/**
+	 * Examines sequence of characters for the ZModem ZRQINIT frame requesting
+	 * start of download, and indicates whether it is seen.
+	 * 
+	 * @param ch Next character in the sequence.
+	 * @return True if ZRQINIT has been received, false otherwise.
+	 */
 	public boolean autoDownloadDetect(char ch) {
 		/*
 		 * Chapter 7.2  Link Escape Encoding
@@ -214,44 +226,34 @@ public class XYModem {
 		return false;
 	}
 	
+	/**
+	 * Begin download of file(s).
+	 * Returns when download is complete, or has been cancelled.
+	 */
 	public void download() {
 		protocol = new ProtocolDetector(io);
 		try {
 			while (true) {
 				block0Done = false;
-				if (!sendHandshake()) {
-					cancel("Handshake timed out.");
-					return;
-				}
+				sendHandshake();
 				if (!downloadFile()) {
 					break;
 				}
-				/*
-				 * Chapter 5.  YMODEM Batch File Transmission
-				 * After the file contents and XMODEM EOT have been transmitted and
-				 * acknowledged, the receiver again asks for the next pathname.
-				 */
 			}
 		} catch (UserCancelException e) {
 			cancel("Download cancelled by user.");
-		} catch (IOException e) {
-			/*
-			 * Chapter 5.  YMODEM Batch File Transmission
-			 * If the file cannot be
-			 * opened for writing, the receiver cancels the transfer with CAN characters
-			 * as described above.
-			 */
-			cancel("Error writing file.  Download cancelled.");
+		} catch (AbortDownloadException e) {
+			cancel("Download cancelled: " + e.getMessage());
 		}
 	}
 	
 	/**
 	 * Send handshake and wait for response.
 	 * 
-	 * @return True if response arrived, false if timed out.
+	 * @throws AbortDownloadException If handshake times out.
 	 * @throws UserCancelException If user cancelled the download.
 	 */
-	private boolean sendHandshake() throws UserCancelException {
+	private void sendHandshake() throws AbortDownloadException, UserCancelException {
 		// wait until nothing coming in
 		purge();
 		/*
@@ -268,10 +270,13 @@ public class XYModem {
 			 * Chapter 7.3.1  Common_to_Both_Sender_and_Receiver
 			 * All errors are retried 10 times.
 			 */
-			return retry(10, () -> {
+			if (retry(10, () -> {
 				io.write(handshake);
 				return waitForData(10000);
-			});
+			})) {
+				return;
+			}
+			throw new AbortDownloadException("Handshake timed out.");
 		}
 		/*
 		 * Chapter 6.  YMODEM-g File Transmission
@@ -290,7 +295,7 @@ public class XYModem {
 // here we will know if streaming ==> YModem-G
 			protocol.setStreaming(true);
 			handshake = 'G';
-			return true;
+			return;
 		}
 		protocol.setStreaming(false);
 		/*
@@ -340,7 +345,7 @@ public class XYModem {
 // here we know if CRC ==> XModem-CRC, XModem-1K, YModem-Batch
 			protocol.setCRC(true);
 			handshake = 'C';
-			return true;
+			return;
 		}
 		protocol.setCRC(false);
 		io.log("Starting XModem-Checksum...");
@@ -351,24 +356,19 @@ public class XYModem {
 		})) {
 // here we know if Checksum ==> XModem-Checksum
 			handshake = NAK;
-			return true;
+			return;
 		}
-		return false;
+		throw new AbortDownloadException("Handshake timed out.");
 	}
 
 	/**
 	 * Download a file.
 	 * 
-	 * @return True if session can continue, false to end session.
+	 * @return True if possibly more files to download, false if download(s) complete.
+	 * @throws AbortDownloadException If download is aborted.
 	 * @throws UserCancelException If user cancelled the download.
-	 * @throws IOException 
 	 */
-	private boolean downloadFile() throws UserCancelException, IOException {
-		/*
-		 * Chapter 7.2  Transmission Medium Level Protocol
-		 * Each block of the transfer looks like:
-		 * 		<SOH><blk #><255-blk #><--128 data bytes--><cksum>
-		 */
+	private boolean downloadFile() throws AbortDownloadException, UserCancelException {
 		boolean endOfFile = false;
 		Character lastBlockNum = null;
 		Download download = null;
@@ -379,7 +379,7 @@ public class XYModem {
 				/*
 				 * Chapter 7.3.1  Common_to_Both_Sender_and_Receiver
 				 * All errors are retried 10 times.
-				 * [We choose to interpret that as each block is attempted 10 times, regardless of the specific error.]
+				 * [I choose to interpret that as each block is attempted 10 times, regardless of the specific error.]
 				 */
 				int retries;
 				for (retries=0; retries<10; retries++) {
@@ -390,12 +390,7 @@ public class XYModem {
 						 * If an error is detected in a YMODEM-g transfer, the receiver aborts the
 						 * transfer with the multiple CAN abort sequence.
 						 */
-						if (protocol.isStreaming) {
-							cancel("Timed out waiting for block header.  Download aborted.");
-							return false;
-						}
-System.out.println("NAK: Block header timeout.");
-						nak();
+						nakOrThrow("Timed out waiting for block header.");
 						continue;	// retry the block
 					}
 					if ((header[0] == EOT) || (header[0] == EOF)) {
@@ -408,16 +403,11 @@ System.out.println("NAK: Block header timeout.");
 						if (!endOfFile && !protocol.isStreaming) {
 							// make them send EOT twice, to make sure not glitched data
 							endOfFile = true;
-System.out.println("NAK: Doublecheck EOT.");
-							nak();
+							nak("Doublecheck EOT.");
 							continue;	// retry the block
 						}
 						os.close();
-						try {
-							download.resetLastModified();
-						} catch (IOException e) {
-							// just ignore the error
-						}
+						download.resetLastModified();
 						io.log("Download complete.");
 						io.received(download);
 						// reset the per-file vars, in case another file coming
@@ -438,6 +428,11 @@ System.out.println("NAK: Doublecheck EOT.");
 						 * each file.
 						 */
 						io.write(ACK);
+						/*
+						 * Chapter 5.  YMODEM Batch File Transmission
+						 * After the file contents and XMODEM EOT have been transmitted and
+						 * acknowledged, the receiver again asks for the next pathname.
+						 */
 						return protocol.isBatch;
 					}
 					int packetSize;
@@ -454,6 +449,12 @@ System.out.println("NAK: Doublecheck EOT.");
 					 * block contains 1024 bytes of data.  The receiver should be able to accept
 					 * any mixture of 128 and 1024 byte blocks.
 					 */
+					/*
+					 * Chapter 5.  YMODEM Batch File Transmission
+					 * If, perchance, this information extends beyond 128 bytes (possible
+					 * with Unix 4.2 BSD extended file names), the block should be sent as a
+					 * 1k block as described above.
+					 */
 					switch (header[0]) {
 						case SOH:	// 128-byte packets. XModem, XModem-CRC, XModem-1K, YModem-Batch
 // here (block 1) we know if 128 ==> XModem, XModem-CRC, XModem-1K, YModem-Batch
@@ -469,27 +470,17 @@ System.out.println("NAK: Doublecheck EOT.");
 							 * If an error is detected in a YMODEM-g transfer, the receiver aborts the
 							 * transfer with the multiple CAN abort sequence.
 							 */
-							if (protocol.isStreaming) {
-								cancel("Invalid packet header (0x" + Integer.toHexString(header[0]) + ").  Download aborted.");
-								return false;
-							}
-System.out.println("NAK: Invalid packet header 0x" + Integer.toHexString(header[0]) + ".");
-							nak();
+							nakOrThrow("Invalid packet header (0x" + Integer.toHexString(header[0]) + ").");
 							continue;	// retry the block
 					}
-					char blockNum = (char)(header[1] & 0xFF);
-					if ((header[2] & 0xFF) != (255 - blockNum)) {
+					Character blockNum = getBlockNum(header);
+					if (blockNum == null) {
 						/*
 						 * Chapter 6.  YMODEM-g File Transmission
 						 * If an error is detected in a YMODEM-g transfer, the receiver aborts the
 						 * transfer with the multiple CAN abort sequence.
 						 */
-						if (protocol.isStreaming) {
-							cancel("Invalid block number.  Download aborted.");
-							return false;
-						}
-System.out.println("NAK: Invalid block number " + blockNum + ".");
-						nak();
+						nakOrThrow("Invalid block number (" + blockNum + ").");
 						continue;	// retry the block
 					}
 					/*
@@ -504,25 +495,39 @@ System.out.println("NAK: Invalid block number " + blockNum + ".");
 					 */
 					if (((lastBlockNum == null) && (blockNum > 1)) 
 							|| ((lastBlockNum != null) && (blockNum != lastBlockNum) && (blockNum != (lastBlockNum + 1)))) {
-						cancel("Out of sequence block number.  Download aborted.");
-						return false;
+						throw new AbortDownloadException("Out of sequence block number (" + blockNum + ").");
 					}
-					byte[] packet = readPacket(packetSize);
+					/*
+					 * Chapter 4.3  XMODEM-1k 1024 Byte Block
+					 * An STX (02) replaces the SOH (01) at the beginning of the transmitted
+					 * block to notify the receiver of the longer block length.  The transmitted
+					 * block contains 1024 bytes of data.  The receiver should be able to accept
+					 * any mixture of 128 and 1024 byte blocks.
+					 */
+					/*
+					 * Chapter 7.2  Transmission Medium Level Protocol
+					 * Each block of the transfer looks like:
+					 * 		<SOH><blk #><255-blk #><--128 data bytes--><cksum>
+					 */
+					/*
+					 * Chapter 7.4  Programming Tips
+					 * After receiving the <soh>, the receiver should call the character
+					 * receive subroutine with a 1-second timeout, for the remainder of the
+					 * message and the <cksum>.  Since they are sent as a continuous stream,
+					 * timing out of this implies a serious like glitch that caused, say,
+					 * 127 characters to be seen instead of 128.
+					 */
+					byte[] packet = readBytes(packetSize, 1000);
 					if (packet == null) {
 						/*
 						 * Chapter 6.  YMODEM-g File Transmission
 						 * If an error is detected in a YMODEM-g transfer, the receiver aborts the
 						 * transfer with the multiple CAN abort sequence.
 						 */
-						if (protocol.isStreaming) {
-							cancel("Timed out waiting for block data.  Download aborted.");
-							return false;
-						}
-System.out.println("NAK: Block data timeout.");
-						nak();
+						nakOrThrow("Timed out waiting for block data.");
 						continue;	// retry the block
 					}
-					boolean valid = false;
+					byte[] crc;
 					if (protocol.isCRC) {
 						/*
 						 * Chapter 4.2  CRC-16 Option
@@ -534,68 +539,36 @@ System.out.println("NAK: Block data timeout.");
 						 * Each block of the transfer in CRC mode looks like:
 						 * 		<SOH><blk #><255-blk #><--128 data bytes--><CRC hi><CRC lo>
 						 */
-						Character ch = readData(1000);
-System.out.print("{"+ch+"0x"+Integer.toHexString(ch)+"}");
-						if (ch == null) {
-							if (protocol.isStreaming) {
-								cancel("Timed out waiting for CRC.  Download aborted.");
-								return false;
-							}
-System.out.println("NAK: Block CRC timeout.");
-							nak();
-							continue;	// retry the block
-						}
-						Character ch2 = readData(1000);
-System.out.print("{"+ch2+"0x"+Integer.toHexString(ch2)+"}");
-						if (ch2 == null) {
-							if (protocol.isStreaming) {
-								cancel("Timed out waiting for CRC.  Download aborted.");
-								return false;
-							}
-System.out.println("NAK: Block CRC timeout.");
-							nak();
-							continue;	// retry the block
-						}
-						char crc = (char)((ch << 8) + ch2);
-						valid = (crc == CRC.calculate(CRC.CRC16_CCITT_XModem, packet));
-System.out.println("Expected CRC 0x" + Integer.toHexString(crc) + ", got 0x" + Long.toHexString(CRC.calculate(CRC.CRC16_CCITT_XModem, packet)));
+						crc = readBytes(2, 1000);
 					} else {
 						/*
 						 * Chapter 7.2  Transmission Medium Level Protocol
 						 * Each block of the transfer looks like:
 						 * 		<SOH><blk #><255-blk #><--128 data bytes--><cksum>
 						 */
-						Character ch = readData(1000);
-						if (ch == null) {
-							if (protocol.isStreaming) {
-								cancel("Timed out waiting for checksum.  Download aborted.");
-								return false;
-							}
-System.out.println("NAK: Block checksum timeout.");
-							nak();
-							continue;	// retry the block
-						}
-						long checksum = CRC.calculate(CRC.Checksum8, packet);
-System.out.println("Expected checksum 0x" + Integer.toHexString(ch) + ", got 0x" + Long.toHexString(checksum));
-						valid = (ch == checksum);
+						crc = readBytes(1, 1000);
 					}
-					if (!valid) {
+					if (crc == null) {
 						/*
 						 * Chapter 6.  YMODEM-g File Transmission
 						 * If an error is detected in a YMODEM-g transfer, the receiver aborts the
 						 * transfer with the multiple CAN abort sequence.
 						 */
-						if (protocol.isStreaming) {
-							cancel("Invalid block CRC.  Download aborted.");
-							return false;
-						}
+						nakOrThrow("Timed out waiting for block CRC/checksum.");
+						continue;	// retry the block
+					}
+					if (!checkCRC(packet, crc)) {
+						/*
+						 * Chapter 6.  YMODEM-g File Transmission
+						 * If an error is detected in a YMODEM-g transfer, the receiver aborts the
+						 * transfer with the multiple CAN abort sequence.
+						 */
 						/*
 						 * Chapter 5.  YMODEM Batch File Transmission
 						 * If the filename block is received with a CRC or other error, a
 						 * retransmission is requested.
 						 */
-System.out.println("NAK: Invalid CRC/checksum.");
-						nak();
+						nakOrThrow("Invalid block CRC/checksum.");
 						continue;	// retry the block
 					}
 					/*
@@ -714,22 +687,45 @@ System.out.println("NAK: Invalid CRC/checksum.");
 					break;	// on to the next block
 				}	// end of retry loop
 				if (retries >= 10) {
-					cancel("Too many errors.  Download aborted.");
-					return false;
+					throw new AbortDownloadException("Too many errors.  Download aborted.");
 				}
 				// on to the next block
 			}
+		} catch (IOException e) {
+			/*
+			 * Chapter 5.  YMODEM Batch File Transmission
+			 * If the file cannot be
+			 * opened for writing, the receiver cancels the transfer with CAN characters
+			 * as described above.
+			 */
+			throw new AbortDownloadException("Error writing file.", e);
 		} finally {
 			if (os != null) {
-				os.close();
+				try {
+					os.close();
+				} catch (IOException e) {
+					// just ignore the error
+				}
 			}
 			if (download != null) {
-				Files.delete(download.file);
+				try {
+					Files.delete(download.file);
+				} catch (IOException e) {
+					// just ignore the error
+				}
 			}
 		}
 	}
 	
-	private byte[] readHeader() throws UserCancelException {
+	/**
+	 * Reads and returns the next block header.
+	 * Returns early if 1st byte is EOT or EOF, or if 1st and 2nd are CAN.
+	 * 
+	 * @return Read header bytes, or null if timeout.
+	 * @throws UserCancelException If user cancelled the download.
+	 * @throws AbortDownloadException If sender cancelled the download.
+	 */
+	private byte[] readHeader() throws UserCancelException, AbortDownloadException {
 		/*
 		 * Chapter 7.2  Transmission Medium Level Protocol
 		 * Each block of the transfer looks like:
@@ -780,9 +776,13 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		 */
 		if (ch == CAN) {
 			ch = readData(timeout);
-			if ((ch == null) || (ch != CAN)) {
+			if (ch == null) {
 				return null;
 			}
+			if (ch == CAN) {
+				throw new AbortDownloadException("Cancel received from sender.");
+			}
+			// Not a valid header, but not a cancel.  Give up and return the data so far.
 			header[1] = (byte)(ch & 0xFF);
 			return header;
 		}
@@ -794,48 +794,147 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		 * any mixture of 128 and 1024 byte blocks.
 		 */
 		if ((ch != SOH) && (ch != STX)) {
+			// Not a valid header.  Give up and return the data so far.
 			return header;
 		}
-		ch = readData(timeout);
-		if (ch == null) {
+		byte[] bytes = readBytes(2, timeout);
+		if (bytes == null) {
 			return null;
 		}
-		header[1] = (byte)(ch & 0xFF);
-		ch = readData(timeout);
-		if (ch == null) {
-			return null;
-		}
-		header[2] = (byte)(ch & 0xFF);
+		header[1] = bytes[0];
+		header[2] = bytes[1];
 		return header;
 	}
 	
-	private byte[] readPacket(int packetSize) throws UserCancelException {
+	/**
+	 * Reads block number from given header.
+	 * 
+	 * @param header Header to read block number from.
+	 * @return Block number, or null if invalid value.
+	 */
+	private Character getBlockNum(byte[] header) {
 		/*
-		 * Chapter 7.4  Programming Tips
-		 * After receiving the <soh>, the receiver should call the character
-		 * receive subroutine with a 1-second timeout, for the remainder of the
-		 * message and the <cksum>.  Since they are sent as a continuous stream,
-		 * timing out of this implies a serious like glitch that caused, say,
-		 * 127 characters to be seen instead of 128.
+		 * Chapter 7.2  Transmission Medium Level Protocol
+		 * Each block of the transfer looks like:
+		 * 		<SOH><blk #><255-blk #><--128 data bytes--><cksum>
 		 */
-		byte[] packet = new byte[packetSize];
-		for (int i=0; i<packetSize; i++) {
-			Character ch = readData(1000);
-			if (ch == null) {
-				return null;
-			}
-			packet[i] = (byte)(ch & 0xFF);
+		char blockNum = (char)(header[1] & 0xFF);
+		if ((header[2] & 0xFF) == (255 - blockNum)) {
+			return blockNum;
 		}
-		return packet;
+		return null;
+	}
+	
+	/**
+	 * Calculate the CRC/checksum of the given packet, and verify it matches the given CRC/checksum.
+	 * 
+	 * @param packet Packet to calculate CRC/checksum for.
+	 * @param crc Expected CRC/checksum bytes.
+	 * @return True if the CRC/checksum validates.
+	 */
+	private boolean checkCRC(byte[] packet, byte[] crc) {
+		long expected = 0;
+		for (int i=0; i<crc.length; i++) {
+			expected = (expected << 8) + (crc[i] & 0xFF);
+		}
+		long received;
+		if (protocol.isCRC) {
+			/*
+			 * Chapter 4.2  CRC-16 Option
+			 * A two byte CRC is sent in place of the one
+			 * byte arithmetic checksum.
+			 */
+			/*
+			 * Chapter 8.  XMODEM/CRC Overview
+			 * Each block of the transfer in CRC mode looks like:
+			 * 		<SOH><blk #><255-blk #><--128 data bytes--><CRC hi><CRC lo>
+			 */
+			received = CRC.calculate(CRC.CRC16_CCITT_XModem, packet);
+		} else {
+			/*
+			 * Chapter 7.2  Transmission Medium Level Protocol
+			 * Each block of the transfer looks like:
+			 * 		<SOH><blk #><255-blk #><--128 data bytes--><cksum>
+			 */
+			received = CRC.calculate(CRC.Checksum8, packet);
+		}
+System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", got 0x" + Long.toHexString(received));
+		return (expected == received);
 	}
 
-	// read filename, size, etc from block 0
-	private Download processBlock0(byte[] packet) throws IOException {
+	/**
+	 * Parse block 0 into an array of strings.
+	 * 
+	 * @param packet Block 0 packet.
+	 * @return Array of strings from block 0.
+	 */
+	private String[] readBlock0Strings(byte[] packet) {
+		StringBuilder sb = new StringBuilder();
+		List<String> strings = new ArrayList<>();
+		for (int i=0; i<packet.length; i++) {
+			byte b = packet[i];
+			if (b == 0x00) {
+				/*
+				 * Chapter 2.  YMODEM MINIMUM REQUIREMENTS
+				 * The pathname shall be a null terminated ASCII string [...].
+				 */
+				/*
+				 * Chapter 5.  YMODEM Batch File Transmission
+				 * The pathname (conventionally, the file name) is sent as a null
+				 * terminated ASCII string.
+				 * No spaces are included in the pathname.
+				 * Transmission of a null pathname terminates batch file transmission.
+				 * Note that transmission of no files is not necessarily an error.  This is
+				 * possible if none of the files requested of the sender could be opened for
+				 * reading.
+				 * The file length and each of the succeeding fields are optional.
+				 * Fields may not be skipped.
+				 * YMODEM was designed to allow additional header fields to be
+				 * added as above without creating compatibility problems with older
+				 * YMODEM programs.
+				 * The rest of the block is set to nulls.  This is essential to preserve
+				 * upward compatibility.
+				 */
+				if (sb.length() > 0) {
+					strings.add(sb.toString());
+				}
+				break;
+			}
+			if (b == 0x20) {
+				/*
+				 * Chapter 5.  YMODEM Batch File Transmission
+				 * No spaces are included in the pathname.
+				 * The mod date is optional, and the filename and length
+				 * may be sent without requiring the mod date to be sent.
+				 * Iff the modification date is sent, a single space separates the
+				 * modification date from the file length.
+				 * Iff the file mode is sent, a single space separates the file mode
+				 * from the modification date.
+				 * Iff the serial number is sent, a single space separates the
+				 * serial number from the file mode.
+				 */
+				strings.add(sb.toString());
+				sb.setLength(0);
+				continue;
+			}
+			sb.append((char)(b & 0xFF));
+		}
+		return (String[])strings.toArray();
+	}
+	
+	/**
+	 * Read data from block 0 and create a Download object with local file to write.
+	 * 
+	 * @param packet Block 0 packet.
+	 * @return New Download object.
+	 * @throws AbortDownloadException If error when creating new file.
+	 */
+	private Download processBlock0(byte[] packet) throws AbortDownloadException {
+		String[] strings = readBlock0Strings(packet);
 		// FILENAME
 		/*
 		 * Chapter 2.  YMODEM MINIMUM REQUIREMENTS
 		 * The sending program shall send the pathname (file name) in block 0.
-		 * The pathname shall be a null terminated ASCII string [...].
 		 */
 		/*
 		 * Chapter 5.  YMODEM Batch File Transmission
@@ -849,22 +948,11 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		 * possible if none of the files requested of the sender could be opened for
 		 * reading.
 		 */
-		if (packet[0] == 0x00) {
+		if (strings.length < 1) {
 			return null;
 		}
-		int i = 0;
-		String temp = "";
-		while (i < packet.length) {
-			byte b = packet[i];
-			if (b == 0x00) {
-				i++;
-				break;
-			}
-			temp += (char)b;
-			i++;
-		}
-		Download download = new Download(temp);
-		if ((i >= packet.length) || (packet[i] == 0x00)) {
+		Download download = new Download(strings[0]);
+		if (strings.length < 2) {
 			return download;
 		}
 
@@ -880,22 +968,12 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		 * The receiver stores the specified number of characters, discarding
 		 * any padding added by the sender to fill up the last block.
 		 */
-		temp = "";
-		while (i < packet.length) {
-			byte b = packet[i];
-			if ((b == 0x20) || (b == 0x00)) {
-				i++;
-				break;
-			}
-			temp += (char)b;
-			i++;
-		}
 		try {
-			download.length = Long.parseLong(temp);
+			download.length = Long.parseLong(strings[1]);
 		} catch (NumberFormatException e) {
 			// just leave it at 0
 		}
-		if ((i >= packet.length) || (packet[i] == 0x00)) {
+		if (strings.length < 3) {
 			return download;
 		}
 		
@@ -904,84 +982,50 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		 * Chapter 5.  YMODEM Batch File Transmission
 		 * The mod date is optional, and the filename and length
 		 * may be sent without requiring the mod date to be sent.
-		 * Iff the modification date is sent, a single space separates the
-		 * modification date from the file length.
 		 * The mod date is sent as an octal number giving the time the contents
 		 * of the file were last changed, measured in seconds from Jan 1 1970
 		 * Universal Coordinated Time (GMT).  A date of 0 implies the
 		 * modification date is unknown and should be left as the date the file
 		 * is received.
 		 */
-		temp = "";
-		while (i < packet.length) {
-			byte b = packet[i];
-			if ((b == 0x20) || (b == 0x00)) {
-				i++;
-				break;
-			}
-			temp += (char)b;
-			i++;
-		}
 		try {
-			download.setFileTime(Long.parseLong(temp, 8));
+			download.setFileTime(Long.parseLong(strings[2], 8));
 		} catch (NumberFormatException e) {
 			// just leave it at 0
 		}
-		if ((i >= packet.length) || (packet[i] == 0x00)) {
+		if (strings.length < 4) {
 			return download;
 		}
 		
 		// FILE MODE
 		/*
 		 * Chapter 5.  YMODEM Batch File Transmission
-		 * Iff the file mode is sent, a single space separates the file mode
-		 * from the modification date.  The file mode is stored as an octal
+		 * The file mode is stored as an octal
 		 * string.  Unless the file originated from a Unix system, the file mode
 		 * is set to 0.
 		 */
-		temp = "";
-		while (i < packet.length) {
-			byte b = packet[i];
-			if ((b == 0x20) || (b == 0x00)) {
-				i++;
-				break;
-			}
-			temp += (char)b;
-			i++;
-		}
 		try {
-			download.mode = Integer.parseInt(temp, 8);
+			download.mode = Integer.parseInt(strings[3], 8);
 		} catch (NumberFormatException e) {
 			// just leave it at 0
 		}
-		if ((i >= packet.length) || (packet[i] == 0x00)) {
+		if (strings.length < 5) {
 			return download;
 		}
 		
 		// SERIAL NUMBER
 		/*
 		 * Chapter 5.  YMODEM Batch File Transmission
-		 * Iff the serial number is sent, a single space separates the
-		 * serial number from the file mode.  The serial number of the
+		 * The serial number of the
 		 * transmitting program is stored as an octal string.  Programs which do
 		 * not have a serial number should omit this field, or set it to 0.
 		 */
-		temp = "";
-		while (i < packet.length) {
-			byte b = packet[i];
-			if ((b == 0x20) || (b == 0x00)) {
-				i++;
-				break;
-			}
-			temp += (char)b;
-			i++;
-		}
 		try {
-			download.serial = Integer.parseInt(temp, 8);
+			download.serial = Integer.parseInt(strings[4], 8);
 		} catch (NumberFormatException e) {
 			// just leave it at 0
 		}
-		if ((i >= packet.length) || (packet[i] == 0x00)) {
+		if (strings.length < 6) {
 			return download;
 		}
 
@@ -1000,6 +1044,11 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		return download;
 	}
 	
+	/**
+	 * Purge all incoming data in the queue.
+	 * 
+	 * @throws UserCancelException If user cancelled the download.
+	 */
 	private void purge() throws UserCancelException {
 		/*
 		 * Chapter 7.4  Programming Tips
@@ -1010,7 +1059,28 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		while (readData(1000) != null) {}
 	}
 	
-	private void nak() throws UserCancelException {
+	/**
+	 * Purge waiting data and send NAK, or abort if protocol.isStreaming.
+	 * 
+	 * @param message Reason for NAK/abort.
+	 * @throws AbortDownloadException If protocol.isStreaming
+	 * @throws UserCancelException If user cancelled the download.
+	 */
+	private void nakOrThrow(String message) throws AbortDownloadException, UserCancelException {
+		if (protocol.isStreaming) {
+			throw new AbortDownloadException(message);
+		}
+		nak(message);
+	}
+	
+	/**
+	 * Purge waiting data and send NAK.
+	 * 
+	 * @param message Reason for NAK.
+	 * @throws UserCancelException If user cancelled the download.
+	 */
+	private void nak(String message) throws UserCancelException {
+System.out.println("NAK: " + message);
 		/*
 		 * Chapter 7.3.2  Receive_Program_Considerations
 		 * If the receiver wishes to <nak> a
@@ -1028,6 +1098,11 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		io.write(NAK);
 	}
 	
+	/**
+	 * Cancel the download.
+	 * 
+	 * @param message Reason for cancellation.
+	 */
 	private void cancel(String message) {
 		io.log(message);
 		try {
@@ -1049,6 +1124,26 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		for (int i=0; i<8; i++) {
 			io.write(BS);
 		}
+	}
+	
+	/**
+	 * Read the given number of bytes, and return them in an array.
+	 * 
+	 * @param num Number of bytes to read.
+	 * @param timeout Milliseconds to wait before timing out.
+	 * @return Array of bytes, or null if timed out.
+	 * @throws UserCancelException If user cancelled the download.
+	 */
+	private byte[] readBytes(int num, int timeout) throws UserCancelException {
+		byte[] bytes = new byte[num];
+		for (int i=0; i<num; i++) {
+			Character ch = readData(timeout);
+			if (ch == null) {
+				return null;
+			}
+			bytes[i] = (byte)(ch & 0xFF);
+		}
+		return bytes;
 	}
 
 	/**
@@ -1101,11 +1196,27 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		return false;
 	}
 	
+	/**
+	 * Functional interface used by retry().
+	 */
 	private interface Retrier {
+		/**
+		 * Called to make an attempt.
+		 * 
+		 * @return True if attempt succeeded, false if it failed.
+		 * @throws UserCancelException If user cancelled the download.
+		 */
 		public boolean attempt() throws UserCancelException;
 	}
 	
+	/**
+	 * Class for checking off protocol options to identify protocol in use.
+	 * Also keeps some flags for decisions during download.
+	 */
 	private static class ProtocolDetector {
+		/**
+		 * Possible protocols.
+		 */
 		private enum Protocol {
 			XModemChecksum ("XModem-Checksum"),
 			XModemCRC ("XModem-CRC"),
@@ -1120,16 +1231,33 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		private final List<Protocol> protocols;
 		private final IOHandler io;
 		private boolean reported = false;
+		/**
+		 * Is CRC being used?
+		 */
 		public boolean isCRC = false;
+		/**
+		 * Is this a batch transfer?
+		 */
 		public boolean isBatch = false;
+		/**
+		 * Is this a streaming transfer?
+		 */
 		public boolean isStreaming = false;
 
+		/**
+		 * Create a new ProtocolDetector.
+		 * 
+		 * @param ioHandler IOHandler to use for announcing detected protocol.
+		 */
 		public ProtocolDetector(IOHandler ioHandler) {
 			this.io = ioHandler;
 			this.protocols = new ArrayList<>();
 			this.protocols.addAll(Arrays.asList(Protocol.values()));
 		}
 		
+		/**
+		 * If protocol is confirmed, and not previously announced, announce it.
+		 */
 		private void logProtocol() {
 			if (!reported && (protocols.size() == 1)) {
 				reported = true;
@@ -1137,6 +1265,11 @@ System.out.println("NAK: Invalid CRC/checksum.");
 			}
 		}
 		
+		/**
+		 * Set CRC on or off.
+		 * 
+		 * @param on CRC state to set.
+		 */
 		public void setCRC(boolean on) {
 			if (on) {
 				isCRC = true;
@@ -1151,6 +1284,11 @@ System.out.println("NAK: Invalid CRC/checksum.");
 			logProtocol();
 		}
 		
+		/**
+		 * Set streaming on or off.
+		 * 
+		 * @param on Streaming state to set.
+		 */
 		public void setStreaming(boolean on) {
 			if (on) {
 				isCRC = true;
@@ -1166,6 +1304,11 @@ System.out.println("NAK: Invalid CRC/checksum.");
 			logProtocol();
 		}
 		
+		/**
+		 * Set batch on or off.
+		 * 
+		 * @param on Batch state to set.
+		 */
 		public void setBatch(boolean on) {
 			if (on) {
 				isBatch = true;
@@ -1180,6 +1323,11 @@ System.out.println("NAK: Invalid CRC/checksum.");
 			logProtocol();
 		}
 		
+		/**
+		 * Set 1K blocks on or off.
+		 * 
+		 * @param on 1K blocks state to set.
+		 */
 		public void set1K(boolean on) {
 			if (on) {
 				protocols.remove(Protocol.XModemChecksum);
@@ -1193,15 +1341,3 @@ System.out.println("NAK: Invalid CRC/checksum.");
 		}
 	}
 }
-
-/*
-***zmodem start***
-
-[G]
-**B00000000000000
-
-[]
-
-
-*/
-
