@@ -870,7 +870,8 @@ System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", 
 	 */
 	private String[] readBlock0Strings(byte[] packet) {
 		StringBuilder sb = new StringBuilder();
-		List<String> strings = new ArrayList<>();
+		String[] strings = new String[5];
+		int strNum = 0;
 		for (int i=0; i<packet.length; i++) {
 			byte b = packet[i];
 			if (b == 0x00) {
@@ -896,7 +897,13 @@ System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", 
 				 * upward compatibility.
 				 */
 				if (sb.length() > 0) {
-					strings.add(sb.toString());
+					strings[strNum] = sb.toString();
+					strNum++;
+					sb.setLength(0);
+					if (strNum == 1) {
+						// we just saved null-terminated filename
+						continue;
+					}
 				}
 				break;
 			}
@@ -913,13 +920,14 @@ System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", 
 				 * Iff the serial number is sent, a single space separates the
 				 * serial number from the file mode.
 				 */
-				strings.add(sb.toString());
+				strings[strNum] = sb.toString();
+				strNum++;
 				sb.setLength(0);
 				continue;
 			}
 			sb.append((char)(b & 0xFF));
 		}
-		return (String[])strings.toArray();
+		return strings;
 	}
 	
 	/**
@@ -948,13 +956,10 @@ System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", 
 		 * possible if none of the files requested of the sender could be opened for
 		 * reading.
 		 */
-		if (strings.length < 1) {
+		if (strings[0] == null) {
 			return null;
 		}
 		Download download = new Download(strings[0]);
-		if (strings.length < 2) {
-			return download;
-		}
 
 		// FILE SIZE
 		/*
@@ -968,13 +973,13 @@ System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", 
 		 * The receiver stores the specified number of characters, discarding
 		 * any padding added by the sender to fill up the last block.
 		 */
+		if (strings[1] == null) {
+			return download;
+		}
 		try {
 			download.length = Long.parseLong(strings[1]);
 		} catch (NumberFormatException e) {
 			// just leave it at 0
-		}
-		if (strings.length < 3) {
-			return download;
 		}
 		
 		// MODIFICATION TIME
@@ -988,13 +993,13 @@ System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", 
 		 * modification date is unknown and should be left as the date the file
 		 * is received.
 		 */
+		if (strings[2] == null) {
+			return download;
+		}
 		try {
 			download.setFileTime(Long.parseLong(strings[2], 8));
 		} catch (NumberFormatException e) {
 			// just leave it at 0
-		}
-		if (strings.length < 4) {
-			return download;
 		}
 		
 		// FILE MODE
@@ -1004,13 +1009,13 @@ System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", 
 		 * string.  Unless the file originated from a Unix system, the file mode
 		 * is set to 0.
 		 */
+		if (strings[3] == null) {
+			return download;
+		}
 		try {
 			download.mode = Integer.parseInt(strings[3], 8);
 		} catch (NumberFormatException e) {
 			// just leave it at 0
-		}
-		if (strings.length < 5) {
-			return download;
 		}
 		
 		// SERIAL NUMBER
@@ -1020,13 +1025,13 @@ System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", 
 		 * transmitting program is stored as an octal string.  Programs which do
 		 * not have a serial number should omit this field, or set it to 0.
 		 */
+		if (strings[4] == null) {
+			return download;
+		}
 		try {
 			download.serial = Integer.parseInt(strings[4], 8);
 		} catch (NumberFormatException e) {
 			// just leave it at 0
-		}
-		if (strings.length < 6) {
-			return download;
 		}
 
 		// OTHER FIELDS?
