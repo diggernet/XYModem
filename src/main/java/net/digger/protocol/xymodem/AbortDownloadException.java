@@ -14,13 +14,21 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package net.digger.protocol;
+package net.digger.protocol.xymodem;
 
 /**
- * Exception to be thrown by the IOHandler implementation if the user cancels the download.
+ * Exception used internally if a download must be cancelled.
  * 
  * @author walton
  */
-public class UserCancelException extends Exception {
-	private static final long serialVersionUID = -3871658053132691499L;
+public class AbortDownloadException extends Exception {
+	private static final long serialVersionUID = -4040231966962658288L;
+
+	public AbortDownloadException(String message) {
+		super(message);
+	}
+	
+	public AbortDownloadException(String message, Throwable cause) {
+		super(message, cause);
+	}
 }
