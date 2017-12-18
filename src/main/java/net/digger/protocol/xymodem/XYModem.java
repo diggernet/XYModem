@@ -19,6 +19,8 @@ package net.digger.protocol.xymodem;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -83,7 +85,6 @@ public class XYModem {
 	private Character waitingData = null;
 	private ProtocolDetector protocol;
 	private Character handshake = null;
-	private boolean block0Done = false;
 	private int autoDownloadIndex = 0;
 	
 	/**
@@ -234,7 +235,6 @@ public class XYModem {
 		protocol = new ProtocolDetector(io);
 		try {
 			while (true) {
-				block0Done = false;
 				sendHandshake();
 				if (!downloadFile()) {
 					break;
@@ -373,7 +373,8 @@ public class XYModem {
 		Character lastBlockNum = null;
 		Download download = null;
 		OutputStream os = null;
-		int count = 0;
+		long count = 0;
+		Instant start = Instant.now();
 		try {
 			while (true) {
 				/*
@@ -408,7 +409,8 @@ public class XYModem {
 						}
 						os.close();
 						download.resetLastModified();
-						io.log("Download complete.");
+						Duration elapsed = Duration.between(start, Instant.now());
+						io.log("Download complete.  Elapsed time: " + formatElapsedTime(elapsed) + " (" + formatBPS(count, elapsed) + ")");
 						io.received(download);
 						// reset the per-file vars, in case another file coming
 						endOfFile = false;
@@ -480,7 +482,7 @@ public class XYModem {
 						 * If an error is detected in a YMODEM-g transfer, the receiver aborts the
 						 * transfer with the multiple CAN abort sequence.
 						 */
-						nakOrThrow("Invalid block number (" + blockNum + ").");
+						nakOrThrow("Invalid block number (0x" + Integer.toHexString(header[1] & 0xFF) + ").");
 						continue;	// retry the block
 					}
 					/*
@@ -493,9 +495,8 @@ public class XYModem {
 					 * synchronization, such as the rare case of the sender getting a line-glitch
 					 * that looked like an <ack>.  Abort the transmission, sending a <can>
 					 */
-					if (((lastBlockNum == null) && (blockNum > 1)) 
-							|| ((lastBlockNum != null) && (blockNum != lastBlockNum) && (blockNum != (lastBlockNum + 1)))) {
-						throw new AbortDownloadException("Out of sequence block number (" + blockNum + ").");
+					if (!validBlockNum(blockNum, lastBlockNum)) {
+						throw new AbortDownloadException("Out of sequence block number (0x" + Integer.toHexString(blockNum) + ").");
 					}
 					/*
 					 * Chapter 4.3  XMODEM-1k 1024 Byte Block
@@ -579,81 +580,85 @@ public class XYModem {
 					 * indicates that the receivers <ack> got glitched, and the sender re-
 					 * transmitted; [...].
 					 */
-					// only process the block if it's not a repeat
-					if ((lastBlockNum == null) || (blockNum != lastBlockNum)) {
-						if (blockNum == 0) {
+					if (lastBlockNum == null) {
+						if (blockNum == 0x00) {
 // here we know if batch (block 0) ==> YModem-Batch
-							if (!block0Done) {
-								protocol.setBatch(true);
-								download = processBlock0(packet);
-								/*
-								 * Chapter 2.  YMODEM MINIMUM REQUIREMENTS
-								 * The end of a transfer session shall be signified by a null (empty)
-								 * pathname, this pathname block shall be acknowledged the same as other
-								 * pathname blocks.
-								 */
-								/*
-								 * Chapter 5.  YMODEM Batch File Transmission
-								 * Transmission of a null pathname terminates batch file transmission.
-								 * Note that transmission of no files is not necessarily an error.  This is
-								 * possible if none of the files requested of the sender could be opened for
-								 * reading.
-								 */
-								if (download == null) {
-									io.log("No more files to download.");
-									/*
-									 * Chapter 6.  YMODEM-g File Transmission
-									 * When the sender recognizes the G, it
-									 * bypasses the usual wait for an ACK to each transmitted block, sending
-									 * succeeding blocks at full speed, subject to XOFF/XON or other flow control
-									 * exerted by the medium.
-									 */
-									if (!protocol.isStreaming) {
-										io.write(ACK);
-									}
-									return false;
-								}
-								os = Files.newOutputStream(download.file);
-								block0Done = true;
-								lastBlockNum = blockNum;
-								/*
-								 * Chapter 2.  YMODEM MINIMUM REQUIREMENTS
-								 * When the receiving program receives this block and successfully
-								 * opened the output file, it shall acknowledge this block with an ACK
-								 * character and then proceed with a normal XMODEM file transfer
-								 * beginning with a "C" or NAK tranmsitted by the receiver.
-								 */
-								/*
-								 * Chapter 5.  YMODEM Batch File Transmission
-								 * After the filename block has been received,
-								 * it is ACK'ed if the write open is successful.
-								 * The receiver then initiates transfer of the file contents with a "C"
-								 * character, according to the standard XMODEM/CRC protocol.
-								 */
+							protocol.setBatch(true);
+							download = processBlock0(packet);
+							/*
+							 * Chapter 2.  YMODEM MINIMUM REQUIREMENTS
+							 * The end of a transfer session shall be signified by a null (empty)
+							 * pathname, this pathname block shall be acknowledged the same as other
+							 * pathname blocks.
+							 */
+							/*
+							 * Chapter 5.  YMODEM Batch File Transmission
+							 * Transmission of a null pathname terminates batch file transmission.
+							 * Note that transmission of no files is not necessarily an error.  This is
+							 * possible if none of the files requested of the sender could be opened for
+							 * reading.
+							 */
+							if (download == null) {
+								io.log("No more files to download.");
 								/*
 								 * Chapter 6.  YMODEM-g File Transmission
 								 * When the sender recognizes the G, it
 								 * bypasses the usual wait for an ACK to each transmitted block, sending
 								 * succeeding blocks at full speed, subject to XOFF/XON or other flow control
 								 * exerted by the medium.
-								 * The sender expects an inital G to initiate the transmission of a
-								 * particular file, and also expects an ACK on the EOT sent at the end of
-								 * each file.
 								 */
 								if (!protocol.isStreaming) {
 									io.write(ACK);
 								}
-								io.write(handshake);
-								break;	// on to the next block (and file)
+								return false;
 							}
-						} else if (blockNum == 1) {
-							if (!block0Done) {
-								protocol.setBatch(false);
-								download = new Download();
-								os = Files.newOutputStream(download.file);
+							String message = "Downloading " + download.name;
+							if (download.length > 0) {
+								message += " (" + formatBytes(download.length) + ")";
 							}
+							io.log(message);
+							os = Files.newOutputStream(download.file);
+							io.progress(count, download.length);
+							lastBlockNum = blockNum;
+							/*
+							 * Chapter 2.  YMODEM MINIMUM REQUIREMENTS
+							 * When the receiving program receives this block and successfully
+							 * opened the output file, it shall acknowledge this block with an ACK
+							 * character and then proceed with a normal XMODEM file transfer
+							 * beginning with a "C" or NAK tranmsitted by the receiver.
+							 */
+							/*
+							 * Chapter 5.  YMODEM Batch File Transmission
+							 * After the filename block has been received,
+							 * it is ACK'ed if the write open is successful.
+							 * The receiver then initiates transfer of the file contents with a "C"
+							 * character, according to the standard XMODEM/CRC protocol.
+							 */
+							/*
+							 * Chapter 6.  YMODEM-g File Transmission
+							 * When the sender recognizes the G, it
+							 * bypasses the usual wait for an ACK to each transmitted block, sending
+							 * succeeding blocks at full speed, subject to XOFF/XON or other flow control
+							 * exerted by the medium.
+							 * The sender expects an inital G to initiate the transmission of a
+							 * particular file, and also expects an ACK on the EOT sent at the end of
+							 * each file.
+							 */
+							if (!protocol.isStreaming) {
+								io.write(ACK);
+							}
+							io.write(handshake);
+							break;	// on to the next block (and file)
+						} else if (blockNum == 0x01) {
+							protocol.setBatch(false);
+							download = new Download();
+							os = Files.newOutputStream(download.file);
 							protocol.set1K(header[0] == STX);
+							io.progress(count, download.length);
 						}
+					}
+					// only process the block if it's not a repeat
+					if ((lastBlockNum == null) || (blockNum != lastBlockNum)) {
 						if (download.length == 0) {
 							os.write(packet);
 							count += packet.length;
@@ -820,9 +825,40 @@ public class XYModem {
 		 */
 		char blockNum = (char)(header[1] & 0xFF);
 		if ((header[2] & 0xFF) == (255 - blockNum)) {
+//System.out.println("Block 0x" + Integer.toHexString(blockNum));
 			return blockNum;
 		}
 		return null;
+	}
+	
+	/**
+	 * Check that the current block number is expected, given the previous block number.
+	 * 
+	 * @param blockNum Current block number.
+	 * @param lastBlockNum Previous block number.
+	 * @return True if in sequence.
+	 */
+	private boolean validBlockNum(char blockNum, Character lastBlockNum) {
+		/*
+		 * Chapter 7.3.2  Receive_Program_Considerations
+		 * If a valid block number is received, it will be: 1) the
+		 * expected one, in which case everything is fine; or 2) a repeat of the
+		 * previously received block.  This should be considered OK, and only
+		 * indicates that the receivers <ack> got glitched, and the sender re-
+		 * transmitted; 3) any other block number indicates a fatal loss of
+		 * synchronization, such as the rare case of the sender getting a line-glitch
+		 * that looked like an <ack>.  Abort the transmission, sending a <can>
+		 */
+		if (lastBlockNum == null) {
+			if ((blockNum == 0x00) || (blockNum == 0x01)) {
+				return true;
+			}
+			return false;
+		}
+		if ((blockNum == lastBlockNum) || (blockNum == ((lastBlockNum + 1) & 0xFF))) {
+			return true;
+		}
+		return false;
 	}
 	
 	/**
@@ -858,7 +894,7 @@ public class XYModem {
 			 */
 			received = CRC.calculate(CRC.Checksum8, packet);
 		}
-System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", got 0x" + Long.toHexString(received));
+//System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", got 0x" + Long.toHexString(received));
 		return (expected == received);
 	}
 
@@ -1182,6 +1218,68 @@ System.out.println("NAK: " + message);
 		Byte b = io.read(timeout);
 		waitingData = (b == null) ? null : (char)(b & 0xFF);
 		return !(waitingData == null);
+	}
+	
+	/**
+	 * Return the given duration in the format HH:MM:SS.
+	 * 
+	 * @param elapsed Duration to format.
+	 * @return Formatted string.
+	 */
+	public static String formatElapsedTime(Duration elapsed) {
+		long secs = elapsed.getSeconds();
+		return String.format("%02d:%02d:%02d", secs / 3600, (secs % 3600) / 60, (secs % 60));
+	}
+	
+	/**
+	 * Format the given number of bytes per second in friendly Bps, KBps, MBps, GBps, TBps format.
+	 * 
+	 * @param bytes Number of bytes.
+	 * @param elapsed Number of seconds elapsed.
+	 * @return Formatted string of bps.
+	 */
+	public static String formatBPS(long bytes, Duration elapsed) {
+		long secs = elapsed.getSeconds();
+		if (secs == 0) {
+			return formatKMGT(0) + "Bps";
+		}
+		return formatKMGT(bytes / secs) + "Bps";
+	}
+	
+	/**
+	 * Format the given number of bytes in friendly B, KB, MB, GB, TB format.
+	 * 
+	 * @param bytes Number of bytes to format.
+	 * @return Formatted string.
+	 */
+	public static String formatBytes(long bytes) {
+		return formatKMGT(bytes) + "Bytes";
+	}
+	
+	/**
+	 * Format the given number in friendly K, M, G, T format.
+	 * 
+	 * @param bytes Number to format.
+	 * @return Formatted string.
+	 */
+	private static String formatKMGT(double bytes) {
+		if (bytes < 1024) {
+			return String.format("%.0f ", bytes);
+		}
+		bytes /= 1024;
+		if (bytes < 1024) {
+			return String.format("%.3f K", bytes);
+		}
+		bytes /= 1024;
+		if (bytes < 1024) {
+			return String.format("%.3f M", bytes);
+		}
+		bytes /= 1024;
+		if (bytes < 1024) {
+			return String.format("%.3f G", bytes);
+		}
+		bytes /= 1024;
+		return String.format("%.3f T", bytes);
 	}
 
 	/**
