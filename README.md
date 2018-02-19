@@ -12,6 +12,14 @@ It also implements just enough of ZModem for AutoDownload support,
 though that only works if the sending ZModem implemenation provides
 automatic fallback to XModem or YModem.
 
+## Maven configuration
+
+		<dependency>
+			<groupId>net.digger</groupId>
+			<artifactId>xymodem</artifactId>
+			<version>1.0.0</version>
+		</dependency>
+
 ## Usage
 
 Create an implemenation of IOHandler, to provide I/O methods appropriate
@@ -64,7 +72,7 @@ for a ZModem download to begin.
 
 ## Dependencies
 * [Java 8](https://www.oracle.com/java)
-* [net.digger.util.crc.CRC](https://github.com/diggernet/JavaCRC)
+* [JavaCRC](https://github.com/diggernet/JavaCRC)
 
 
 ## License
