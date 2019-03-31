@@ -17,7 +17,7 @@ automatic fallback to XModem or YModem.
 		<dependency>
 			<groupId>net.digger</groupId>
 			<artifactId>xymodem</artifactId>
-			<version>1.0.0</version>
+			<version>1.1.0</version>
 		</dependency>
 
 ## Usage
@@ -48,6 +48,10 @@ When the download session is complete, `XYModem.download()` will return.
 
 During the download process, `IOHandler.log(message)` and `IOHandler.progress(bytes, total)`
 will be called with messages and download progress.
+
+Before beginning a download, you can call `xymodem.setOverrunOption()`
+to set the desired behavior if a file received via the YModem protocol
+exceeds the size claimed by the sender.
 
 **AutoDownload**
 
