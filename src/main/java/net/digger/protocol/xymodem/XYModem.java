@@ -1,5 +1,5 @@
 /**
- * Copyright © 2017  David Walton
+ * Copyright © 2017-2019  David Walton
  * 
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -77,7 +77,7 @@ public class XYModem {
 		 */
 		MIXED
 	};
-	private static final boolean DEBUG = true;
+	private static final boolean DEBUG = false;
 	private static final int CAN_COUNT = 8;
 	
 	// X/YModem characters
