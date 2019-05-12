@@ -1,5 +1,5 @@
 /**
- * Copyright © 2017  David Walton
+ * Copyright © 2017-2019  David Walton
  * 
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -18,7 +18,9 @@ package net.digger.protocol.xymodem;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -46,6 +48,38 @@ import net.digger.util.crc.CRC;
  * @author walton
  */
 public class XYModem {
+	/**
+	 * Behavior options for data received past the end of a downloaded file, when file length
+	 * is provided by sender in YModem protocol.
+	 */
+	public enum OverrunOption {
+		/**
+		 * Ignore the extra data, and limit the file to the declared size.
+		 * When sender provides file length, the resulting file will always match that length.
+		 * This is what the YModem spec calls for, but can result in data loss if for some
+		 * reason the file is longer than the sender reported.
+		 */
+		IGNORE,
+		/**
+		 * If downloaded file ends on the expected packet, length will be enforced as in OverrunOption.IGNORE.
+		 * If downloaded file continues with additional packets, trigger an error and cancel the download.
+		 */
+		ERROR,
+		/**
+		 * Accept all extra data in file. All downloaded files will be padded to the packet size.
+		 * This makes YModem behave the same as XModem in that regard.
+		 */
+		ACCEPT,
+		/**
+		 * Default setting.
+		 * If downloaded file ends on the expected packet, length will be enforced as in OverrunOption.IGNORE.
+		 * If downloaded file continues with additional packets, they will be kept as in OverrunOption.ACCEPT.
+		 */
+		MIXED
+	};
+	private static final boolean DEBUG = false;
+	private static final int CAN_COUNT = 8;
+	
 	// X/YModem characters
 	private static final char SOH = 0x01;	// Start 128-byte block header
 	private static final char STX = 0x02;	// Start 1024-byte block header
@@ -86,6 +120,7 @@ public class XYModem {
 	private ProtocolDetector protocol;
 	private Character handshake = null;
 	private int autoDownloadIndex = 0;
+	private OverrunOption overrunOption = OverrunOption.MIXED;
 	
 	/**
 	 * Create new instance of XYModem.
@@ -94,6 +129,10 @@ public class XYModem {
 	 */
 	public XYModem(IOHandler ioHandler) {
 		this.io = ioHandler;
+	}
+	
+	public void setOverrunOption(OverrunOption option) {
+		this.overrunOption = option;
 	}
 	
 	/**
@@ -255,7 +294,7 @@ public class XYModem {
 	 */
 	private void sendHandshake() throws AbortDownloadException, UserCancelException {
 		// wait until nothing coming in
-		purge();
+		purge(false);
 		/*
 		 * Chapter 7.3.2  Receive_Program_Considerations
 		 * The receiver has a 10-second timeout.  It sends a <nak> every time it
@@ -287,7 +326,7 @@ public class XYModem {
 		 * each file.
 		 */
 		// try 'G' a few times
-		io.log("Checking for YModem-G...");
+		log("Checking for YModem-G...");
 		if (retry(3, () -> {
 			io.write('G');
 			return waitForData(2000);
@@ -337,7 +376,7 @@ public class XYModem {
 		 * instead of ignoring the extra <C>.
 		 */
 		// try 'C' a few times
-		io.log("Checking for YModem-Batch, XModem-1K or XModem-CRC...");
+		log("Checking for YModem-Batch, XModem-1K or XModem-CRC...");
 		if (retry(3, () -> {
 			io.write('C');
 			return waitForData(2000);
@@ -348,7 +387,7 @@ public class XYModem {
 			return;
 		}
 		protocol.setCRC(false);
-		io.log("Starting XModem-Checksum...");
+		log("Starting XModem-Checksum...");
 		// try NAK a few times
 		if (retry(4, () -> {
 			io.write(NAK);
@@ -370,10 +409,11 @@ public class XYModem {
 	 */
 	private boolean downloadFile() throws AbortDownloadException, UserCancelException {
 		boolean endOfFile = false;
-		Character lastBlockNum = null;
+		Character prevBlockNum = null;
 		Download download = null;
 		OutputStream os = null;
 		long count = 0;
+		boolean possibleLastPacket = false;
 		Instant start = Instant.now();
 		try {
 			while (true) {
@@ -408,16 +448,58 @@ public class XYModem {
 							continue;	// retry the block
 						}
 						os.close();
+						if (download.length != 0) {
+							long overrun = count - download.length;
+							if (overrun < 0) {
+								// file ended before expected packet
+								log("Received file was shorter than declared length.");
+								log(formatBytes(count) + " / " + formatBytes(download.length) + " (short " + formatBytes(-overrun) + ").");
+							} else if (overrun > 0) {
+								if (possibleLastPacket) {
+									// file ended on the expected packet
+									/*
+									 * Chapter 5.  YMODEM Batch File Transmission
+									 * The receiver stores the specified number of characters, discarding
+									 * any padding added by the sender to fill up the last block.
+									 */
+									if (overrunOption != OverrunOption.ACCEPT) {
+										// Here we follow the spec and discard any extra chars from the last packet.
+										// Note: This could cause data loss if a file overruns but still ends in the same packet.
+										debug("\nTruncating downloaded file from %d to %d.\n", count, download.length);
+										FileChannel fc = FileChannel.open(download.file, StandardOpenOption.WRITE);
+										fc.truncate(download.length);
+										fc.close();
+									}
+								} else {
+									// file ended after expected packet
+									if (overrunOption == OverrunOption.IGNORE) {
+										debug("\nTruncating downloaded file from %d to %d.\n", count, download.length);
+										FileChannel fc = FileChannel.open(download.file, StandardOpenOption.WRITE);
+										fc.truncate(download.length);
+										fc.close();
+									} else {
+										// Here we are forgiving and allow the extra data, to handle cases where the file sent
+										// was longer than claimed.
+										// (if option is ERROR, we should have already thrown)
+										log("Received file was longer than declared length.");
+										log(formatBytes(count) + " / " + formatBytes(download.length) + " (extra " + formatBytes(overrun) + ").");
+									}
+								}
+							}
+							// else file ended on the expected packet, exactly on packet boundary
+						}
 						download.resetLastModified();
 						Duration elapsed = Duration.between(start, Instant.now());
-						io.log("Download complete.  Elapsed time: " + formatElapsedTime(elapsed) + " (" + formatBPS(count, elapsed) + ")");
+						log("Download complete.  Elapsed time: " + formatElapsedTime(elapsed) + " (" + formatBPS(count, elapsed) + ")");
+						debug("File: %s\n", download.file.toString());
 						io.received(download);
 						// reset the per-file vars, in case another file coming
 						endOfFile = false;
-						lastBlockNum = null;
+						prevBlockNum = null;
 						download = null;
 						os = null;
 						count = 0;
+						possibleLastPacket = false;
 						/*
 						 * Chapter 2.  YMODEM MINIMUM REQUIREMENTS
 						 * At the end of each file, the sending program shall send EOT up to ten
@@ -495,7 +577,7 @@ public class XYModem {
 					 * synchronization, such as the rare case of the sender getting a line-glitch
 					 * that looked like an <ack>.  Abort the transmission, sending a <can>
 					 */
-					if (!validBlockNum(blockNum, lastBlockNum)) {
+					if (!validBlockNum(blockNum, prevBlockNum)) {
 						throw new AbortDownloadException("Out of sequence block number (0x" + Integer.toHexString(blockNum) + ").");
 					}
 					/*
@@ -518,6 +600,7 @@ public class XYModem {
 					 * timing out of this implies a serious like glitch that caused, say,
 					 * 127 characters to be seen instead of 128.
 					 */
+					debug(" Reading %d byte packet.", packetSize);
 					byte[] packet = readBytes(packetSize, 1000);
 					if (packet == null) {
 						/*
@@ -540,6 +623,7 @@ public class XYModem {
 						 * Each block of the transfer in CRC mode looks like:
 						 * 		<SOH><blk #><255-blk #><--128 data bytes--><CRC hi><CRC lo>
 						 */
+						debug(" Reading CRC...");
 						crc = readBytes(2, 1000);
 					} else {
 						/*
@@ -547,6 +631,7 @@ public class XYModem {
 						 * Each block of the transfer looks like:
 						 * 		<SOH><blk #><255-blk #><--128 data bytes--><cksum>
 						 */
+						debug(" Reading checksum...");
 						crc = readBytes(1, 1000);
 					}
 					if (crc == null) {
@@ -580,7 +665,7 @@ public class XYModem {
 					 * indicates that the receivers <ack> got glitched, and the sender re-
 					 * transmitted; [...].
 					 */
-					if (lastBlockNum == null) {
+					if (prevBlockNum == null) {
 						if (blockNum == 0x00) {
 // here we know if batch (block 0) ==> YModem-Batch
 							protocol.setBatch(true);
@@ -599,7 +684,7 @@ public class XYModem {
 							 * reading.
 							 */
 							if (download == null) {
-								io.log("No more files to download.");
+								log("No more files to download.");
 								/*
 								 * Chapter 6.  YMODEM-g File Transmission
 								 * When the sender recognizes the G, it
@@ -616,10 +701,10 @@ public class XYModem {
 							if (download.length > 0) {
 								message += " (" + formatBytes(download.length) + ")";
 							}
-							io.log(message);
+							log(message);
 							os = Files.newOutputStream(download.file);
 							io.progress(count, download.length);
-							lastBlockNum = blockNum;
+							prevBlockNum = blockNum;
 							/*
 							 * Chapter 2.  YMODEM MINIMUM REQUIREMENTS
 							 * When the receiving program receives this block and successfully
@@ -658,26 +743,38 @@ public class XYModem {
 						}
 					}
 					// only process the block if it's not a repeat
-					if ((lastBlockNum == null) || (blockNum != lastBlockNum)) {
-						if (download.length == 0) {
+					if ((prevBlockNum == null) || (blockNum != prevBlockNum)) {
+						if (possibleLastPacket) {
+							// the previous packet was supposed to be the last, but here we are with another packet
+							String message = "File has exceeded its declared length: " + formatBytes(download.length);
+							if (overrunOption == OverrunOption.ERROR) {
+								throw new AbortDownloadException(message);
+							}
+							log("File has exceeded its declared length: " + formatBytes(download.length));
+							possibleLastPacket = false;
+						}
+
+						long afterPacket = count + packet.length;
+						// if a length was given, and the current count is less than the length
+						// but this packet will meet or exceed the length, this might be the
+						// last packet (unless there is an overrun).
+						if ((download.length != 0) && (count < download.length) && (afterPacket >= download.length)) {
+							possibleLastPacket = true;
+						}
+						// if no length given, or still below declared size, or option is ACCEPT or MIXED, accept the data
+						if ((download.length == 0) || (count <= download.length)
+								|| (overrunOption == OverrunOption.ACCEPT) || (overrunOption == OverrunOption.MIXED)) {
 							os.write(packet);
 							count += packet.length;
 						} else {
-							/*
-							 * Chapter 5.  YMODEM Batch File Transmission
-							 * The receiver stores the specified number of characters, discarding
-							 * any padding added by the sender to fill up the last block.
-							 */
-							for (byte b : packet) {
-								if (count >= download.length) {
-									break;
-								}
-								os.write(b);
-								count++;
-							}
+							// if length given, and above declared size, and option is IGNORE, drop the data
+							// (if option is ERROR, should have thrown above)
+							debug(" Ignoring packet.");
 						}
+
+						debug(" (%d / %d)", count, download.length);
 						io.progress(count, download.length);
-						lastBlockNum = blockNum;
+						prevBlockNum = blockNum;
 					}
 					/*
 					 * Chapter 6.  YMODEM-g File Transmission
@@ -731,6 +828,7 @@ public class XYModem {
 	 * @throws AbortDownloadException If sender cancelled the download.
 	 */
 	private byte[] readHeader() throws UserCancelException, AbortDownloadException {
+		debug("\nReading header...");
 		/*
 		 * Chapter 7.2  Transmission Medium Level Protocol
 		 * Each block of the transfer looks like:
@@ -752,6 +850,7 @@ public class XYModem {
 		int timeout = 10000;
 		ch = readData(timeout);
 		if (ch == null) {
+			debug(" NULL\n");
 			return null;
 		}
 		header[0] = (byte)(ch & 0xFF);
@@ -770,6 +869,7 @@ public class XYModem {
 		 */
 		timeout = 1000;
 		if ((ch == EOT) || (ch == EOF)) {
+			debug(" 0x%02x %s\n", (int)ch, (ch == EOT) ? "EOT" : "EOF");
 			return header;
 		}
 		/*
@@ -780,14 +880,18 @@ public class XYModem {
 		 * when is waiting for the beginning of a block [...].
 		 */
 		if (ch == CAN) {
+			debug(" 0x%02x CAN", (int)ch);
 			ch = readData(timeout);
 			if (ch == null) {
+				debug(" NULL\n");
 				return null;
 			}
 			if (ch == CAN) {
+				debug(" 0x%02x CAN\n", (int)ch);
 				throw new AbortDownloadException("Cancel received from sender.");
 			}
 			// Not a valid header, but not a cancel.  Give up and return the data so far.
+			debug(" 0x%02x INVALID\n", (int)ch);
 			header[1] = (byte)(ch & 0xFF);
 			return header;
 		}
@@ -800,12 +904,16 @@ public class XYModem {
 		 */
 		if ((ch != SOH) && (ch != STX)) {
 			// Not a valid header.  Give up and return the data so far.
+			debug(" 0x%02x INVALID\n", (int)ch);
 			return header;
 		}
+		debug(" 0x%02x %s:", (int)ch, (ch == SOH) ? "SOH" : "STX");
 		byte[] bytes = readBytes(2, timeout);
 		if (bytes == null) {
+			debug(" NULL\n");
 			return null;
 		}
+		debug(" [0x%02x, 0x%02x].", bytes[0], bytes[1]);
 		header[1] = bytes[0];
 		header[2] = bytes[1];
 		return header;
@@ -825,7 +933,7 @@ public class XYModem {
 		 */
 		char blockNum = (char)(header[1] & 0xFF);
 		if ((header[2] & 0xFF) == (255 - blockNum)) {
-//System.out.println("Block 0x" + Integer.toHexString(blockNum));
+			debug(" Block %02x.", (int)blockNum);
 			return blockNum;
 		}
 		return null;
@@ -835,10 +943,10 @@ public class XYModem {
 	 * Check that the current block number is expected, given the previous block number.
 	 * 
 	 * @param blockNum Current block number.
-	 * @param lastBlockNum Previous block number.
+	 * @param prevBlockNum Previous block number.
 	 * @return True if in sequence.
 	 */
-	private boolean validBlockNum(char blockNum, Character lastBlockNum) {
+	private boolean validBlockNum(char blockNum, Character prevBlockNum) {
 		/*
 		 * Chapter 7.3.2  Receive_Program_Considerations
 		 * If a valid block number is received, it will be: 1) the
@@ -849,13 +957,13 @@ public class XYModem {
 		 * synchronization, such as the rare case of the sender getting a line-glitch
 		 * that looked like an <ack>.  Abort the transmission, sending a <can>
 		 */
-		if (lastBlockNum == null) {
+		if (prevBlockNum == null) {
 			if ((blockNum == 0x00) || (blockNum == 0x01)) {
 				return true;
 			}
 			return false;
 		}
-		if ((blockNum == lastBlockNum) || (blockNum == ((lastBlockNum + 1) & 0xFF))) {
+		if ((blockNum == prevBlockNum) || (blockNum == ((prevBlockNum + 1) & 0xFF))) {
 			return true;
 		}
 		return false;
@@ -894,8 +1002,9 @@ public class XYModem {
 			 */
 			received = CRC.calculate(CRC.Checksum8, packet);
 		}
-//System.out.println("Expected CRC/checksum 0x" + Long.toHexString(expected) + ", got 0x" + Long.toHexString(received));
-		return (expected == received);
+		boolean ok = (expected == received);
+		debug(ok ? "OK." : "Expected %04x, got %04x.", expected, received);
+		return ok;
 	}
 
 	/**
@@ -974,6 +1083,7 @@ public class XYModem {
 	 * @throws AbortDownloadException If error when creating new file.
 	 */
 	private Download processBlock0(byte[] packet) throws AbortDownloadException {
+		debug("\nBlock0:");
 		String[] strings = readBlock0Strings(packet);
 		// FILENAME
 		/*
@@ -993,8 +1103,10 @@ public class XYModem {
 		 * reading.
 		 */
 		if (strings[0] == null) {
+			debug(" NULL\n");
 			return null;
 		}
+		debug(" Name:'%s'", strings[0]);
 		Download download = new Download(strings[0]);
 
 		// FILE SIZE
@@ -1006,10 +1118,14 @@ public class XYModem {
 		 * the number of data bytes in the file.  The file length does not
 		 * include any CPMEOF (^Z) or other garbage characters used to pad the
 		 * last block.
+		 * If the file being transmitted is growing during transmission, the
+		 * length field should be set to at least the final expected file
+		 * length, or not sent.
 		 * The receiver stores the specified number of characters, discarding
 		 * any padding added by the sender to fill up the last block.
 		 */
 		if (strings[1] == null) {
+			debug("\n");
 			return download;
 		}
 		try {
@@ -1017,6 +1133,7 @@ public class XYModem {
 		} catch (NumberFormatException e) {
 			// just leave it at 0
 		}
+		debug(", Length:%d ('%s')", download.length, strings[1]);
 		
 		// MODIFICATION TIME
 		/*
@@ -1030,6 +1147,7 @@ public class XYModem {
 		 * is received.
 		 */
 		if (strings[2] == null) {
+			debug("\n");
 			return download;
 		}
 		try {
@@ -1037,6 +1155,7 @@ public class XYModem {
 		} catch (NumberFormatException e) {
 			// just leave it at 0
 		}
+		debug(", Time:%s ('%s')", download.modified.toString(), strings[2]);
 		
 		// FILE MODE
 		/*
@@ -1046,6 +1165,7 @@ public class XYModem {
 		 * is set to 0.
 		 */
 		if (strings[3] == null) {
+			debug("\n");
 			return download;
 		}
 		try {
@@ -1053,6 +1173,7 @@ public class XYModem {
 		} catch (NumberFormatException e) {
 			// just leave it at 0
 		}
+		debug(", Mode:%d ('%s')", download.mode, strings[3]);
 		
 		// SERIAL NUMBER
 		/*
@@ -1062,6 +1183,7 @@ public class XYModem {
 		 * not have a serial number should omit this field, or set it to 0.
 		 */
 		if (strings[4] == null) {
+			debug("\n");
 			return download;
 		}
 		try {
@@ -1069,6 +1191,7 @@ public class XYModem {
 		} catch (NumberFormatException e) {
 			// just leave it at 0
 		}
+		debug(", Serial:%d ('%s')", download.serial, strings[4]);
 
 		// OTHER FIELDS?
 		/*
@@ -1087,17 +1210,49 @@ public class XYModem {
 	
 	/**
 	 * Purge all incoming data in the queue.
+	 * Returns when no more data is available.
+	 * If cancel is true, also returns after an echoed
+	 * cancel sequence (8 CAN + 8 BS) is read.
 	 * 
+	 * @param cancel True to watch for cancel sequence.
 	 * @throws UserCancelException If user cancelled the download.
 	 */
-	private void purge() throws UserCancelException {
+	private void purge(boolean cancel) throws UserCancelException {
 		/*
 		 * Chapter 7.4  Programming Tips
 		 * The most common technique is for "PURGE" to call the character
 		 * receive subroutine, specifying a 1-second timeout,[1] and looping
 		 * back to PURGE until a timeout occurs.
 		 */
-		while (readData(1000) != null) {}
+		debug("PURGE");
+		int can = 0;
+		int bs = 0;
+		Character ch;
+		while ((ch = readData(1000)) != null) {
+			debug(".");
+			if (cancel) {
+				if (can < CAN_COUNT) {
+					// looking for CAN series
+					if (ch == CAN) {
+						can++;
+					} else {
+						can = 0;
+					}
+				} else if (bs < CAN_COUNT) {
+					// looking for BS series
+					if (ch == BS) {
+						bs++;
+					} else {
+						can = 0;
+						bs = 0;
+					}
+				} else {
+					// found echoed cancel sequence
+					return;
+				}
+			}
+		}
+		debug("\n");
 	}
 	
 	/**
@@ -1109,6 +1264,7 @@ public class XYModem {
 	 */
 	private void nakOrThrow(String message) throws AbortDownloadException, UserCancelException {
 		if (protocol.isStreaming) {
+			debug("\nABORT: %s\n", message);
 			throw new AbortDownloadException(message);
 		}
 		nak(message);
@@ -1121,7 +1277,7 @@ public class XYModem {
 	 * @throws UserCancelException If user cancelled the download.
 	 */
 	private void nak(String message) throws UserCancelException {
-System.out.println("NAK: " + message);
+		debug("\nNAK: %s\n", message);
 		/*
 		 * Chapter 7.3.2  Receive_Program_Considerations
 		 * If the receiver wishes to <nak> a
@@ -1135,7 +1291,7 @@ System.out.println("NAK: " + message);
 		 * any characters in its UART buffer immediately upon completing sending
 		 * a block, to ensure no glitches were mis- interpreted.
 		 */
-		purge();
+		purge(false);
 		io.write(NAK);
 	}
 	
@@ -1145,9 +1301,17 @@ System.out.println("NAK: " + message);
 	 * @param message Reason for cancellation.
 	 */
 	private void cancel(String message) {
-		io.log(message);
+		debug("\nCANCEL: %s\n", message);
+		log(message);
 		try {
-			purge();
+			if (protocol.isStreaming) {
+				// In YModem-g, the sender keeps transmitting until EOF without waiting for ACK.
+				// This means purge never ends until EOF.  So we send a couple CAN before purge
+				// just to make sure it stops.
+				io.write(CAN);
+				io.write(CAN);
+			}
+			purge(true);
 		} catch (UserCancelException e) {
 			// Swallow the exception... We are already cancelling!
 		}
@@ -1159,10 +1323,12 @@ System.out.println("NAK: " + message);
 		 * characters from the remote's keyboard input buffer, in case the remote had
 		 * already aborted the transfer and was awaiting a keyboarded command.
 		 */
-		for (int i=0; i<8; i++) {
+		// In YModem-g, we already sent 2 CANs...
+		int count = protocol.isStreaming ? CAN_COUNT - 2 : CAN_COUNT;
+		for (int i=0; i<count; i++) {
 			io.write(CAN);
 		}
-		for (int i=0; i<8; i++) {
+		for (int i=0; i<CAN_COUNT; i++) {
 			io.write(BS);
 		}
 	}
@@ -1239,7 +1405,7 @@ System.out.println("NAK: " + message);
 	 * @return Formatted string of bps.
 	 */
 	public static String formatBPS(long bytes, Duration elapsed) {
-		long secs = elapsed.getSeconds();
+		double secs = elapsed.getSeconds() + (elapsed.getNano() / 1000000000.0);
 		if (secs == 0) {
 			return formatKMGT(0) + "Bps";
 		}
@@ -1364,7 +1530,9 @@ System.out.println("NAK: " + message);
 		private void logProtocol() {
 			if (!reported && (protocols.size() == 1)) {
 				reported = true;
-				io.log("Detected protocol: " + protocols.get(0).label);
+				String message = "Detected protocol: " + protocols.get(0).label;
+				debug("\n%s\n", message);
+				io.log(message);
 			}
 		}
 		
@@ -1441,6 +1609,17 @@ System.out.println("NAK: " + message);
 				protocols.remove(Protocol.YModemG);
 			}
 			logProtocol();
+		}
+	}
+
+	private void log(String message) {
+		debug("\n%s\n", message);
+		io.log(message);
+	}
+	
+	private static void debug(String format, Object... args) {
+		if (DEBUG) {
+			System.out.printf(format, args);
 		}
 	}
 }

@@ -4,7 +4,7 @@
 
 	<groupId>net.digger</groupId>
 	<artifactId>xymodem</artifactId>
-	<version>1.0.0</version>
+	<version>1.1.0</version>
 
 	<name>${project.groupId}:${project.artifactId}</name>
 	<description>Java implementation of XModem and YModem protocols, for downloading files.</description>
